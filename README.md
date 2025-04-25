@@ -1,0 +1,2 @@
+# shengchengshiAI
+生成式AI实战|基于Transformer和StableDiffusion还有Langchain还有AIAgent|Langchain架构和AIAgent构建包括关键组件和基础应用实例|StableDiffusion技术从软件对比到高级功能还有图像生成的多种应用|深入解析Transformer模型和GPT涵盖关键技术变种扩展和实际应用案例|TensorFlow|PyTorch|HuggFace等生成式AI技术框架
