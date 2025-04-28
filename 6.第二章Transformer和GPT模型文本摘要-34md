@@ -1,0 +1,126 @@
+### 第2章 Transformer和GPT模型
+```python
+tokenized_datasets = raw_datasets.map(preprocess_function, batched=True)
+```
+运行上述代码，输出如下。
+```
+Using bos_token, but it is not set yet.
+Using sep_token, but it is not set yet.
+Using cls_token, but it is not set yet.
+Using mask_token, but it is not set yet.
+```
+通常，Datasets 库会自动缓存结果，以避免下次运行同样的数据处理代码时在此步骤上花费时间。其中的原理是：Datasets 库通常足够智能，能够检测到你传递给 map 的函数是否已更改（如果更改，不使用缓存数据）；例如，如果你更改了前面数据集的代码并重新运行笔记本，它会正确检测到。Datasets 库在使用缓存文件时会警告你，如果你不希望使用缓存，可以在 map 调用中传递 load_from_cache_file=False 以不使用缓存文件，并再次运行预处理逻辑。
+
+请注意，我们传递了 batched=True 来统一批量处理文本。这是为了充分利用我们之前加载的快速分词器的优势，该分词器将使用多线程同时处理批次中的文本。
+
+#### 2.5.4 微调模型
+现在，数据已经准备好，我们可以下载预训练的模型并对其进行微调。由于我们需要处理的是序列预测序列的任务，所以使用 AutoModelForSeq2SeqLM 类即可完成。就像分词器一样，from_pretrained 方法将为我们下载和缓存模型。示例代码如下。
+```python
+from transformers import AutoModelForSeq2SeqLM, DataCollatorForSeq2Seq, Seq2SeqTrainingArguments, Seq2SeqTrainer
+model = AutoModelForSeq2SeqLM.from_pretrained(model_checkpoint)
+```
+要实例化Seq2SeqTrainer，还需要定义以下3个对象。
+- **Seq2SeqTrainingArguments**：这是一个包含所有自定义训练属性的类。它的参数里必须包含一个文件夹名称，该名称将用于保存模型的checkpoint，所有其他参数都是可选的。在这里，我们按如下方式设置其他参数：每个epoch结束时进行评估，调整学习率为2e-5，使用之前定义的batch_size并自定义权重衰减为0.01。此外，由于Seq2SeqTrainer会定期保存模型，而我们的数据集相当大，所以我们为它最多保存3次。接下来，我们使用predict_with_generate选项（正确生成摘要）并激活混合精度训练（以便稍微快一些）。最后一个参数push_to_hub让我们可以在训练期间定期将模型推送到Hugging Face Hub。示例代码如下。
+```python
+batch_size = 16
+model_name = model_checkpoint.split("/")[-1]
+args = Seq2SeqTrainingArguments(f"{model_name}-finetuned-xsum",
+    evaluation_strategy = "epoch",
+    learning_rate=2e-5,
+    per_device_train_batch_size=batch_size,
+    per_device_eval_batch_size=batch_size,
+    weight_decay=0.01,
+    save_total_limit=3,
+    num_train_epochs=1,
+    predict_with_generate=True,
+    fp16=True,
+    push_to_hub=True,
+)
+```
+- **DataCollatorForSeq2Seq**：我们需要一个特殊类型的数据整理器，它不仅会将输入填充到批次中的最大长度，还会在训练中返回标签。示例代码如下。
+```python
+data_collator = DataCollatorForSeq2Seq(tokenizer, model=model)
+```
+- **compute_metrics**：此函数帮助我们从模型的预测中度量指标。我们需要为此定义一个函数，它将仅使用我们之前加载的度量标准（metric），同时在这个函数中，我们还会做一些预处理来将预测的ID变为可阅读的文本。示例代码如下。
+```python
+import nltk
+import numpy as np
+
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True) # 替换标签中的 -100，因为我们无法解码它们
+    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+    # Rouge 期望每个句子后有一个换行符
+    decoded_preds = ["\n".join(nltk.sent_tokenize(pred.strip())) for pred in decoded_preds]
+    decoded_labels = ["\n".join(nltk.sent_tokenize(label.strip())) for label in decoded_labels]
+    # 请注意，其他度量可能没有 `use_aggregator` 参数
+    # 因此将返回一个列表，为每个句子计算一个度量
+    result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True, use_aggregator=True) # 提取一些结果
+    result = {key: value * 100 for key, value in result.items()}
+    # 添加平均生成长度
+    prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in predictions]
+    result["gen_len"] = np.mean(prediction_lens)
+    return {k: round(v, 4) for k, v in result.items()}
+```
+然后我们只须将所有这些函数和对象与我们的数据集一起传递给Seq2SeqTrainer。示例代码如下。
+```python
+trainer = Seq2SeqTrainer(
+    model,
+    args,
+    train_dataset=tokenized_datasets["train"],
+    eval_dataset=tokenized_datasets["validation"],
+    data_collator=data_collator,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics
+)
+```
+现在可以通过调用train方法对模型进行微调。示例代码如下。
+```python
+trainer.train()
+```
+运行上述代码，输出如下。
+
+|Epoch|Training Loss|Validation Loss|Rouge1|Rouge2|RougeL|RougeLsum|Gen Len|Runtime|Samples Per Second|
+| ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- | ---- |
+|1|2.7211|2.479327|28.3009|7.7211|22.243|22.2496|18.8225|326.3338|34.725|
+
+#### 2.5.5 推理
+想出一些你想要总结的文本。对于T5，你需要根据自己正在处理的任务为输入添加前缀。示例代码如下。
+```python
+text = "summarize: The Inflation Reduction Act lowers prescription drug costs, health care costs, and energy costs. It's the most aggressive action on tackling the climate crisis in American history, which will lift up American workers and create good-paying, union jobs across the country. It'll lower the deficit and ask the ultra-wealthy and corporations to pay their fair share. And no one making under $400,000 per year will pay a penny more in taxes."
+```
+尝试你的微调的模型进行推理的最简单方法是在pipeline中使用它。用你的模型实例化一个pipeline，并将你的文本传递给它。你可以选择传递一个本地的下面演示的最简单的加载形式。示例代码如下。
+```python
+from transformers import pipeline
+summarizer = pipeline("summarization", model="stehvlhiu/my_awesome_billsum_model")
+summary = summarizer(text)
+```
+如果要加载本地训练的模型，可使用下面的代码（注意将model_path改成训练好的模型地址）。
+```python
+from transformers import pipeline
+model_path = "/path/to/your/local/model"
+summarizer = pipeline("summarization", model=model_path)
+summary = summarizer(text)
+```
+将文本标记化并将input_ids作为PyTorch张量返回。示例代码如下。
+```python
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained("stehvlhiu/my_awesome_billsum_model")
+inputs = tokenizer(text, return_tensors="pt").input_ids
+```
+使用generate方法创建总结。有关不同文本生成策略和控制生成的参数的更多详细信息，请查看Hugging Face上关于文本生成API的内容。示例代码如下。
+```python
+from transformers import AutoModelForSeq2SeqLM
+model = AutoModelForSeq2SeqLM.from_pretrained("stehvlhiu/my_awesome_billsum_model")
+outputs = model.generate(inputs, max_new_tokens=100, do_sample=False)
+```
+将生成的标记ID解码回文本。示例代码如下。
+```python
+tokenizer.decode(outputs[0], skip_special_tokens=True)
+```
+运行上述代码，输出如下。
+```
+'the inflation reduction act lowers prescription drug costs, health care costs, and energy costs. it's the most aggressive action on tackling the climate crisis in american history. it will ask the ultra-wealthy and corporations to pay their fair share.'
+```
+这样，你就可以使用微调后的模型来进行文本总结的推理了。 
