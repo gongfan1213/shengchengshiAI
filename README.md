@@ -1,4 +1,7 @@
 
+![image](https://github.com/user-attachments/assets/674d2f6a-05c9-47a5-8b3a-5aaa8b42465d)
+
+
 ### 目录
 
 #### 第1章 生成式AI基础
